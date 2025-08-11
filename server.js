@@ -47,40 +47,54 @@ io.on('connection', (socket) => {
   console.log('socket connected', socket.id);
 
   socket.on('user_message', async (payload) => {
-    // payload: { id, message }
     try {
-      // optimistic ack (client already shows the user message)
       socket.emit('message_ack', { id: payload.id });
-
-      // Call Ollama local REST /api/generate
-      const res = await fetch(`${OLLAMA_URL}/api/generate`, {
+      const ollamaRes = await fetch(`${OLLAMA_URL}/api/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: process.env.OLLAMA_MODEL || 'llama3.2',
           prompt: payload.message,
-          stream: false
+          stream: true
         })
       });
-
-      if (!res.ok) {
-        const txt = await res.text();
-        console.error('Ollama error', res.status, txt);
+      if (!ollamaRes.ok || !ollamaRes.body) {
+        const txt = await ollamaRes.text();
+        console.error('Ollama error', ollamaRes.status, txt);
         socket.emit('bot_error', { id: payload.id, error: 'Ollama error' });
         return;
       }
-
-      const data = await res.json();
-      // many Ollama responses include `response` field — adjust if your version differs
-      const reply = data.response ?? data.choices?.[0]?.text ?? String(data);
-
-      socket.emit('bot_message', { id: `bot-${Date.now()}`, message: String(reply).trim() });
+      let reply = '';
+      let buffer = '';
+      ollamaRes.body.on('data', (chunk) => {
+        buffer += chunk.toString();
+        let lines = buffer.split('\n');
+        buffer = lines.pop(); // keep incomplete line for next chunk
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const json = JSON.parse(line);
+            if (json.response) {
+              reply += json.response;
+              socket.emit('bot_message', { id: `bot-${Date.now()}`, message: reply });
+            }
+          } catch (e) {
+            // ignore parse errors for incomplete lines
+          }
+        }
+      });
+      ollamaRes.body.on('end', () => {
+        // Optionally emit a final message or completion event
+      });
+      ollamaRes.body.on('error', (err) => {
+        console.error(err);
+        socket.emit('bot_error', { id: payload.id, error: 'Stream error' });
+      });
     } catch (err) {
       console.error(err);
       socket.emit('bot_error', { id: payload.id, error: 'Server error' });
     }
   });
-
   socket.on('disconnect', () => console.log('disconnected', socket.id));
 });
 
